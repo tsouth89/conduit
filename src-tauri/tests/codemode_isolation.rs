@@ -26,10 +26,10 @@ struct Gateway {
 
 impl Gateway {
     fn start() -> Self {
-        Self::configured(|_, _| {}, false)
+        Self::configured(|_, _| {}, None)
     }
 
-    fn configured(configure: impl FnOnce(&mut Registry, &Path), http: bool) -> Self {
+    fn configured(configure: impl FnOnce(&mut Registry, &Path), http_token: Option<&str>) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "toolport-759-{}-{}",
             std::process::id(),
@@ -61,7 +61,7 @@ impl Gateway {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        let http_port = http.then(|| {
+        let http_port = http_token.map(|_| {
             let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             socket.local_addr().unwrap().port()
         });
@@ -97,14 +97,27 @@ impl Gateway {
             next_id: 0,
             http_port,
         };
-        if let Some(port) = http_port {
+        if let (Some(port), Some(token)) = (http_port, http_token) {
             let deadline = Instant::now() + Duration::from_secs(20);
+            let agent = ureq::AgentBuilder::new()
+                .timeout(Duration::from_millis(500))
+                .build();
             loop {
                 assert!(
                     gateway.child.try_wait().unwrap().is_none(),
                     "HTTP gateway exited"
                 );
-                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                // Wait for the authenticated gateway response before sending
+                // scripts: a successful TCP connect alone can report readiness
+                // before this child has actually bound its HTTP listener.
+                let ready = agent
+                    .get(&format!("http://127.0.0.1:{port}/"))
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .call()
+                    .ok()
+                    .and_then(|response| response.into_string().ok())
+                    .is_some_and(|body| body.starts_with("Toolport gateway (HTTP mode)."));
+                if ready {
                     return gateway;
                 }
                 assert!(Instant::now() < deadline, "HTTP gateway failed to listen");
@@ -351,13 +364,13 @@ fn mock_registry(reg: &mut Registry, dir: &Path) {
 
 #[test]
 fn host_calls_remain_ordered_and_completed_work_survives_worker_failure() {
-    let mut gateway = Gateway::configured(mock_registry, false);
+    let mut gateway = Gateway::configured(mock_registry, None);
     let normal = gateway.run(json!({
         "script": "const r = await toolport.callAll(Array.from({ length: 8 }, (_, i) => ({ name: 's__echo', args: { text: String(i) } }))); toolport.checkpoint({ page: 8 }); throw new Error('stop');"
     }));
     assert_eq!(normal["isError"], true, "{normal}");
     let metadata = &normal["structuredContent"]["toolportScript"];
-    assert_eq!(metadata["calls"], 8);
+    assert_eq!(metadata["calls"], 8, "{normal}");
     assert_eq!(metadata["checkpoint"]["page"], 8);
     for (index, entry) in metadata["progress"].as_array().unwrap().iter().enumerate() {
         assert_eq!(entry["index"], index);
@@ -392,7 +405,7 @@ fn isolated_host_calls_preserve_confirmation_pii_and_rate_limits() {
             "rateLimits": [{ "id": "echo-cap", "window": "day", "maxCalls": 1, "tool": "s/echo" }]
         })).unwrap());
         },
-        false,
+        None,
     );
     let result = gateway.run(json!({ "script": "const a = toolport.call('s__echo', {text: 'ada@example.com'}); const b = toolport.call('s__echo', {text: 'second'}); const c = toolport.call('s__delete_item', {a:1,b:2}); return {a,b,c};" }));
     assert_eq!(result["isError"], false, "{result}");
@@ -431,7 +444,7 @@ fn isolated_host_call_cannot_skip_human_approval() {
             mock_registry(reg, dir);
             reg.human_approval = true;
         },
-        false,
+        None,
     );
     let result =
         gateway.run(json!({ "script": "return toolport.call('s__delete_item', {a:1,b:2});" }));
@@ -527,7 +540,7 @@ fn parent_enforces_saved_routine_deadline_during_pure_js() {
             )
             .unwrap();
         },
-        false,
+        None,
     );
     // Cold executable loading and fixture discovery can exceed a short routine
     // budget under Windows ARM's x64 emulation. Warm those paths before timing
@@ -590,7 +603,7 @@ fn http_client_memory_failure_does_not_stop_other_clients_and_scope_stays_enforc
                 });
             }
         },
-        true,
+        Some("client-a"),
     );
     let failure = gateway.http_call("client-a", "toolport_run_script", json!({
         "script": "const buffers = []; for (let i = 0; i < 32; i++) buffers.push(new ArrayBuffer(32 * 1024 * 1024)); return 1;"

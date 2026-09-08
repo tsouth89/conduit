@@ -14,6 +14,7 @@ use crate::codemode::{
 use crate::downstream::CancelContext;
 
 const MAX_WORKERS: usize = 4;
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 struct RunPermit;
@@ -498,6 +499,20 @@ impl WorkerClient {
 /// Internal entry point, before registry, router, keychain, or listeners exist.
 pub fn worker_main() -> ! {
     memory::enable_worker_limit();
+    // Executable entry threads can have a smaller stack than Rust-created
+    // threads. Give Boa a fixed, bounded stack so ordinary nested callbacks do
+    // not overflow before any host call or interpreter recursion check.
+    if let Ok(worker) = std::thread::Builder::new()
+        .name("code-mode-script".into())
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(worker_run)
+    {
+        let _ = worker.join();
+    }
+    std::process::exit(1);
+}
+
+fn worker_run() {
     let mut reader = BufReader::new(std::io::stdin());
     let (script, input, immutable, limits, catalog) = match super::read_frame(&mut reader) {
         Ok(Some(Frame::Start {
