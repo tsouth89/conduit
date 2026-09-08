@@ -32,6 +32,26 @@ gateway entry, written for you when you connect a client:
 Every `TOOLPORT_*` name still accepts the pre-rename `CONDUIT_*` alias (for example
 `CONDUIT_HTTP_TOKEN` continues to work). Prefer `TOOLPORT_*` in new configs.
 
+**Code mode limits.** Execution, validation, and saved routines run Boa in a separate
+worker process. The parent enforces the 60-second wall-clock budget even during pure
+JavaScript and permits at most four simultaneous runs. Saved routines can set lower
+execution limits. Each worker has a 512 MiB allocation budget: Linux uses `RLIMIT_AS`
+before exec, Windows assigns the suspended child to a memory-limited Job Object, and
+macOS uses a worker-only Rust allocator cap because Darwin's `RLIMIT_AS` is advisory.
+The macOS cap covers Boa's Rust heap, not the process's total resident memory. Allocation
+refusal terminates the worker and returns a script error; the gateway stays available.
+On all supported platforms, a worker allocation guard uses a dedicated exit code even
+for fallible buffer allocations. Memory-budget audit attribution comes from the
+worker's exit status, not error text thrown by JavaScript.
+
+Source is capped at 256 KiB, `data` or `input` at 4 MiB of JSON, and `inputSchema` at
+64 KiB on both stdio and HTTP. HTTP's 4 MiB whole-request cap still applies. Worker
+messages, including host results and the final aggregate, are capped at 16 MiB per
+frame. Oversized messages fail explicitly. Host calls still run through the parent's
+scope, approval, content-defense, and rate-limit checks. On failure, completed calls
+and the last checkpoint remain available; calls already in flight are cancelled where
+supported and must not be automatically retried.
+
 **Semantic search (optional).** Lazy discovery ranks tools lexically by default. Point it
 at any `/v1/embeddings` endpoint (LM Studio, Ollama, or a cloud provider) to blend in
 embedding similarity for paraphrased queries: `TOOLPORT_SEMANTIC=on`,

@@ -9,6 +9,7 @@ pub mod brand;
 pub mod catalog;
 pub mod clients;
 pub mod codemode;
+pub mod codemode_worker;
 #[cfg(feature = "desktop")]
 mod desktop;
 pub mod diagnostics_controller;

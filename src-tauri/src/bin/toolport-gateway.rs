@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use conduit_lib::approval;
 use conduit_lib::clients;
 use conduit_lib::codemode;
+use conduit_lib::codemode_worker as worker;
 use conduit_lib::downstream::{
     self, CacheHint, DownstreamServer, MrtrRequest, ResourceUpdatedSink, ServerRequestAction,
     ServerRequestHandler, StdioTransport, Transport, MODERN_PROTOCOL_VERSION, PROTOCOL_VERSION,
@@ -54,6 +55,10 @@ use conduit_lib::secrets;
 use conduit_lib::semantic;
 use conduit_lib::shaping;
 use conduit_lib::{audit, usage_report};
+
+#[cfg(any(unix, windows))]
+#[global_allocator]
+static CODE_MODE_ALLOCATOR: worker::WorkerAllocator = worker::WorkerAllocator;
 
 /// Context that belongs to the request currently executing on this worker.
 ///
@@ -5602,8 +5607,16 @@ fn validate_script(
     let fetch: codemode::FetchBinding =
         Arc::new(|_args: codemode::FetchArgs| json!({ "content": [], "isError": false }));
 
-    let outcome =
-        codemode::run_script_with_input(script, input, call, Some(fetch), limits, &catalog);
+    let outcome = run_code_mode_isolated(
+        script,
+        input,
+        call,
+        Some(fetch),
+        limits,
+        &catalog,
+        None,
+        worker::HostCalls::default(),
+    );
 
     // No `savings::record_orchestration` here: a dry run replaced no round-trips,
     // and counting it would inflate the savings the real feature is measured by.
@@ -6180,6 +6193,12 @@ fn run_script_dispatch_with_candidates(
             });
         }
     };
+    if script.len() > worker::MAX_SCRIPT_BYTES {
+        return routine_error(format!(
+            "run_script `script` exceeds the {}-byte source limit.",
+            worker::MAX_SCRIPT_BYTES
+        ));
+    }
     if let Err(error) = reject_unknown_arguments(
         arguments,
         &["script", "data", "input", "inputSchema", "validate"],
@@ -6199,9 +6218,21 @@ fn run_script_dispatch_with_candidates(
         if !value.is_object() {
             return routine_error("run_script `input` must be an object.");
         }
+        if worker::json_size(&value, worker::MAX_VALUE_BYTES).is_none() {
+            return routine_error(format!(
+                "run_script `input` exceeds the {}-byte value limit.",
+                worker::MAX_VALUE_BYTES
+            ));
+        }
         let Some(schema) = arguments.get("inputSchema").cloned() else {
             return routine_error("run_script `input` requires `inputSchema`.");
         };
+        if worker::json_size(&schema, worker::MAX_SCHEMA_BYTES).is_none() {
+            return routine_error(format!(
+                "run_script `inputSchema` exceeds the {}-byte schema limit.",
+                worker::MAX_SCHEMA_BYTES
+            ));
+        }
         if let Err(error) = routines::validate_arguments(&schema, &value) {
             return routine_error(format!(
                 "run_script input validation failed before execution. {error}"
@@ -6213,13 +6244,14 @@ fn run_script_dispatch_with_candidates(
             true,
         )
     } else {
-        (
-            codemode::ScriptInput::Data(
-                arguments.get("data").cloned().unwrap_or_else(|| json!({})),
-            ),
-            None,
-            false,
-        )
+        let data = arguments.get("data").cloned().unwrap_or_else(|| json!({}));
+        if worker::json_size(&data, worker::MAX_VALUE_BYTES).is_none() {
+            return routine_error(format!(
+                "run_script `data` exceeds the {}-byte value limit.",
+                worker::MAX_VALUE_BYTES
+            ));
+        }
+        (codemode::ScriptInput::Data(data), None, false)
     };
 
     // Dry run: same compile, same scoped `servers.*` surface, same limits, but a
@@ -6324,7 +6356,8 @@ fn execute_script_dispatch_with_candidate(
     let client_owned = client.map(str::to_string);
     let client_name_owned = client_name.map(str::to_string);
     let allowed_owned = allowed.cloned();
-    let cancel_owned = cancel;
+    let host_calls = worker::HostCalls::default();
+    let host_calls_for_binding = host_calls.clone();
     let receipts = Arc::new(Mutex::new(Vec::<ToolReceipt>::new()));
     let receipts_for_call = Arc::clone(&receipts);
 
@@ -6340,6 +6373,7 @@ fn execute_script_dispatch_with_candidate(
     // context). Content defense still runs. Final aggregate is shaped below.
     let call: codemode::CallBinding = Arc::new(move |name: &str, args: Value| {
         let run = || {
+            let host_call = host_calls_for_binding.start();
             let result = execute_call(
                 &reg_owned,
                 &router_owned,
@@ -6347,7 +6381,7 @@ fn execute_script_dispatch_with_candidate(
                 client_owned.as_deref(),
                 client_name_owned.as_deref(),
                 allowed_owned.as_ref(),
-                cancel_owned.clone(),
+                Some(host_call.context.clone()),
                 None,
                 name,
                 args,
@@ -6364,9 +6398,8 @@ fn execute_script_dispatch_with_candidate(
             );
             let fingerprint = tool_fingerprint_for(name, &cached_owned, &router_owned);
             let risk_class = tool_risk_class(name, &cached_owned, &router_owned);
-            let result_bytes = serde_json::to_vec(&result)
-                .map(|bytes| bytes.len())
-                .unwrap_or(0);
+            let result_bytes = worker::json_size(&result, worker::MAX_FRAME_BYTES)
+                .unwrap_or(worker::MAX_FRAME_BYTES + 1);
             receipts_for_call
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6404,8 +6437,16 @@ fn execute_script_dispatch_with_candidate(
         owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
     });
 
-    let outcome =
-        codemode::run_script_with_input(script, input, call, Some(fetch), limits, &catalog);
+    let outcome = run_code_mode_isolated(
+        script,
+        input,
+        call,
+        Some(fetch),
+        limits,
+        &catalog,
+        cancel.clone(),
+        host_calls,
+    );
 
     let candidate_started = Instant::now();
     let candidate_assessment = candidate.map(|context| {
@@ -6516,9 +6557,13 @@ fn execute_script_dispatch_with_candidate(
         Some(v) => format!("checkpoint: {v}. "),
         None => String::new(),
     };
-    let protected_failure_prefix_bytes = checkpoint.as_ref().map_or(0, |checkpoint| {
-        format!("Toolport code mode: the script failed. checkpoint: {checkpoint}. ").len()
-    });
+    let failure_prefix = match routine {
+        Some(routine) => format!("Toolport routine {} failed. ", routine.id()),
+        None => "Toolport code mode: the script failed. ".to_string(),
+    };
+    let protected_failure_prefix_bytes = checkpoint
+        .as_ref()
+        .map_or(0, |_| failure_prefix.len() + checkpoint_text.len());
 
     let ledger_text = if outcome.progress.is_empty() {
         "no calls completed".to_string()
@@ -6546,7 +6591,7 @@ fn execute_script_dispatch_with_candidate(
         (Some(err), Some(routine)) => json!({
             "content": [{
                 "type": "text",
-                "text": format!("Toolport routine {} failed. {ledger_text}. Error: {err}", routine.id())
+                "text": format!("{failure_prefix}{checkpoint_text}{ledger_text}. Error: {err}")
             }],
             "isError": true,
             "structuredContent": {
@@ -6557,6 +6602,7 @@ fn execute_script_dispatch_with_candidate(
                     "ok": false,
                     "calls": outcome.calls,
                     "progress": progress,
+                    "checkpoint": checkpoint,
                     "error": err
                 }
             }
@@ -6564,7 +6610,7 @@ fn execute_script_dispatch_with_candidate(
         (Some(err), None) => json!({
             "content": [{
                 "type": "text",
-                "text": format!("Toolport code mode: the script failed. {checkpoint_text}{ledger_text}. Error: {err}")
+                "text": format!("{failure_prefix}{checkpoint_text}{ledger_text}. Error: {err}")
             }],
             "isError": true,
             "structuredContent": { "toolportScript": { "ok": false, "calls": outcome.calls, "progress": progress, "checkpoint": checkpoint, "error": err } }
@@ -8316,21 +8362,48 @@ fn handle_request_with_cancel(
                         }),
                     ));
                 }
-                return Some(success(
-                    id,
-                    run_script_dispatch_with_candidates(
-                        reg,
-                        router_arc,
-                        cached,
-                        client,
-                        client_name,
-                        allowed,
-                        cancel,
-                        &arguments,
-                        live_router,
-                        candidates,
-                    ),
-                ));
+                let started = Instant::now();
+                let result = run_script_dispatch_with_candidates(
+                    reg,
+                    router_arc,
+                    cached,
+                    client,
+                    client_name,
+                    allowed,
+                    cancel,
+                    &arguments,
+                    live_router,
+                    candidates,
+                );
+                let failed = result
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let detail = result
+                    .pointer("/structuredContent/toolportScript/error")
+                    .or_else(|| result.pointer("/structuredContent/toolportValidate/error"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                // Log attribution and a bounded category, never submitted source,
+                // input values, or arbitrary text thrown by a script.
+                let reason = failed.then_some(
+                    if detail.starts_with("code mode script exceeded its memory budget") {
+                        "code_mode_memory_budget"
+                    } else if detail.contains("wall-clock") {
+                        "code_mode_deadline"
+                    } else {
+                        "code_mode_failed"
+                    },
+                );
+                audit::record_timed(
+                    "toolport",
+                    "run_script",
+                    !failed,
+                    Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+                    reason,
+                    client,
+                );
+                return Some(success(id, result));
             }
 
             if matches!(
@@ -15345,6 +15418,33 @@ fn parse_args(args: &[String]) -> ArgAction {
     ArgAction::Run
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_code_mode_isolated(
+    script: &str,
+    input: codemode::ScriptInput,
+    call: codemode::CallBinding,
+    fetch: Option<codemode::FetchBinding>,
+    limits: codemode::Limits,
+    catalog: &[String],
+    cancel: Option<downstream::CancelContext>,
+    host_calls: worker::HostCalls,
+) -> codemode::ScriptOutcome {
+    if let Err(error) = worker::check_input(script, &input) {
+        return worker::terminated_outcome(0, Vec::new(), error);
+    }
+    #[cfg(test)]
+    {
+        // Cargo's unit-test harness cannot re-enter the gateway's worker mode.
+        // Integration tests exercise the real executable and process boundary.
+        let _ = (cancel, host_calls);
+        codemode::run_script_with_input(script, input, call, fetch, limits, catalog)
+    }
+    #[cfg(not(test))]
+    worker::run_script(
+        script, input, call, fetch, limits, catalog, cancel, host_calls,
+    )
+}
+
 /// Usage text shared by `--help` and the unknown-flag error, so a typo and a
 /// deliberate `--help` land on the same page.
 fn usage() -> String {
@@ -15415,6 +15515,9 @@ fn main() {
     // else touches disk, the keychain, or stdin - see #605. Positional args
     // and the existing four flags fall through to `Run` unchanged.
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if cli_args.first().map(String::as_str) == Some(worker::WORKER_ARG) {
+        worker::worker_main();
+    }
     match parse_args(&cli_args) {
         ArgAction::Help => {
             println!("{}", usage());

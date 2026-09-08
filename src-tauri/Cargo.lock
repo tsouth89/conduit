@@ -858,6 +858,7 @@ dependencies = [
  "keyring",
  "ksni",
  "libadwaita",
+ "libc",
  "regex",
  "security-framework 3.7.0",
  "security-framework-sys",
