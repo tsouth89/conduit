@@ -26,27 +26,28 @@
 //! Downstream calls from a script still pass scope, HITL, and content-defense gates, but
 //! intermediate results are **not** byte-budget shaped: full bodies stay in the sandbox
 //! (they never enter model context). The gateway shapes only the script's final aggregate
-//! for the client. Limits: call budget, wall-clock deadline, max concurrent host calls,
-//! promise-job budget, and boa's loop/recursion caps.
+//! for the client. The gateway runs this interpreter in [`crate::codemode_worker`],
+//! which adds a memory budget, bounded IPC, and an independent wall-clock supervisor
+//! to the call, concurrency, promise-job, loop, and recursion limits below.
 //!
-//! # What actually bounds a pure-JS runaway (SBS-430)
+//! # Interpreter counters and worker containment
 //!
-//! [`Limits::wall_clock`] is NOT enforced while synchronous JS is running. It is checked
+//! Inside this interpreter, [`Limits::wall_clock`] is checked
 //! when a script reserves a host call ([`reserve_budget`]) and between promise jobs
 //! ([`BoundedJobExecutor`]), and boa 0.21 exposes no time-based interrupt to check it
-//! anywhere else. A script that never calls a tool and never awaits is bounded only by
-//! boa's own counters:
+//! anywhere else. The gateway's parent process enforces the deadline even during
+//! synchronous JS and result serialization. Direct in-process callers of this module
+//! have only Boa's own counters on that path:
 //!
 //!   * `loop_iteration_limit` — total loop iterations, across nested loops, not per-loop.
 //!   * recursion limit — depth, which trips almost immediately.
 //!
-//! Both fail closed, so a runaway always terminates. The gap is that the loop bound counts
-//! *iterations*, not *time*: at the 10M default a trivial body measured ~15s, and a heavier
-//! body scales from there with nothing consulting the 60s wall clock. Treat `wall_clock` as
-//! a bound on host-call and async work, not as a hard ceiling on a CPU-bound script.
+//! These count iterations and depth, not allocation or elapsed time. Production
+//! execution, dry runs, and saved routines all require the worker boundary to contain
+//! allocation failures and terminate expensive built-ins.
 //!
 //! `pure_js_runaways_are_bounded_by_count_not_wall_clock` pins this so a boa upgrade that
-//! drops either counter is caught rather than silently removing the only real bound.
+//! drops either counter is caught, independently of the process-isolation tests.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -60,6 +61,7 @@ use boa_engine::object::builtins::JsPromise;
 use boa_engine::property::Attribute;
 use boa_engine::{js_string, Context, JsError, JsNativeError, JsValue, NativeFunction, Source};
 use boa_gc::{Finalize, Trace};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Host binding used for every downstream tool invocation from a script.
@@ -67,6 +69,11 @@ use serde_json::{json, Value};
 /// `Send + Sync` so independent `callAsync` work can run on a small thread pool without
 /// serializing every host call on the JS thread.
 pub type CallBinding = Arc<dyn Fn(&str, Value) -> Value + Send + Sync>;
+
+/// Internal worker binding carries the ledger position across concurrent IPC.
+pub(crate) type IndexedCallBinding = Arc<dyn Fn(usize, &str, Value) -> Value + Send + Sync>;
+
+pub(crate) type CheckpointBinding = Arc<dyn Fn(&Value) -> Result<(), String> + Send + Sync>;
 
 /// Arguments for [`FetchBinding`] / `toolport.fetchResult`.
 #[derive(Debug, Clone)]
@@ -91,12 +98,13 @@ pub enum ScriptInput {
 
 /// Resource limits for one script run. All are fail-closed: exceeding any of them aborts
 /// the script with an error result the agent can read and recover from.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Limits {
     /// Max number of `toolport.call` / `callAsync` / `fetchResult` invocations.
     /// Bounds fan-out, load, and unbounded result paging (WS2-2).
     pub max_calls: usize,
-    /// Wall-clock budget for the whole run, checked at each host call.
+    /// Wall-clock budget for the whole run, enforced by the parent worker supervisor
+    /// and checked by the interpreter at host calls and between promise jobs.
     pub wall_clock: Duration,
     /// Max concurrent host tool calls when scripts fan out with `callAsync` / `Promise.all`.
     pub max_parallel: usize,
@@ -244,7 +252,7 @@ impl JobExecutor for BoundedJobExecutor {
 /// out for exactly that reason. The cost is that the ledger is ORDINAL — it says
 /// which positions in the call sequence completed, not which argument values
 /// did. See [`ScriptOutcome::progress`] for what that means for the caller.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallRecord {
     /// Position in the call sequence, from zero. Explicit rather than implied by
     /// array order so the ordinal contract survives serialization and is legible
@@ -260,7 +268,7 @@ pub struct CallRecord {
 }
 
 /// The outcome of running a script.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScriptOutcome {
     /// The script's return value as JSON (`null` if it returned nothing). Meaningful only
     /// when `error` is `None`.
@@ -340,7 +348,7 @@ unsafe impl Trace for PendingCall {
 
 /// Host state shared with the `__toolport_call` / `__toolport_call_async` native functions.
 struct HostState {
-    call: CallBinding,
+    call: IndexedCallBinding,
     /// Shared with the run so the count survives after the closure is moved into boa.
     calls_made: Rc<Cell<usize>>,
     /// Ledger of calls that actually executed, shared with the run the same way
@@ -350,6 +358,7 @@ struct HostState {
     /// Last checkpoint value the script recorded via `toolport.checkpoint(value)`.
     /// Last-write-wins — a fresh call overwrites, it doesn't append (#663).
     checkpoint: Rc<RefCell<Option<Value>>>,
+    checkpoint_binding: Option<CheckpointBinding>,
     /// Maximum serialized checkpoint size for this run. This is capped against
     /// the active result budget so an accepted checkpoint can always be surfaced
     /// immediately when the script fails.
@@ -363,7 +372,7 @@ struct HostState {
 
 /// A checkpoint is a resume marker, not a payload. Keep it bounded so even a
 /// failure response can surface it without becoming an unbounded escape hatch.
-const MAX_CHECKPOINT_BYTES: usize = 4096;
+pub(crate) const MAX_CHECKPOINT_BYTES: usize = 4096;
 
 /// Space reserved for the failure prefix, shaping marker, and MCP result
 /// envelope. The remainder of the active result budget is available to the
@@ -423,6 +432,7 @@ impl Clone for HostState {
             calls_made: Rc::clone(&self.calls_made),
             executed: Rc::clone(&self.executed),
             checkpoint: Rc::clone(&self.checkpoint),
+            checkpoint_binding: self.checkpoint_binding.clone(),
             max_checkpoint_bytes: self.max_checkpoint_bytes,
             max_calls: self.max_calls,
             max_parallel: self.max_parallel,
@@ -710,6 +720,27 @@ pub fn run_script_with_input(
     limits: Limits,
     catalog: &[String],
 ) -> ScriptOutcome {
+    run_script_indexed(
+        script,
+        input,
+        Arc::new(move |_, name, args| call(name, args)),
+        fetch,
+        limits,
+        catalog,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_script_indexed(
+    script: &str,
+    input: ScriptInput,
+    call: IndexedCallBinding,
+    fetch: Option<FetchBinding>,
+    limits: Limits,
+    catalog: &[String],
+    checkpoint_binding: Option<CheckpointBinding>,
+) -> ScriptOutcome {
     let calls_made = Rc::new(Cell::new(0usize));
     let executed = Rc::new(RefCell::new(Vec::new()));
     let checkpoint = Rc::new(RefCell::new(None::<Value>));
@@ -747,6 +778,7 @@ pub fn run_script_with_input(
         calls_made: calls_made.clone(),
         executed: executed.clone(),
         checkpoint: checkpoint.clone(),
+        checkpoint_binding,
         max_checkpoint_bytes,
         max_calls: limits.max_calls,
         max_parallel: limits.max_parallel.max(1),
@@ -759,7 +791,8 @@ pub fn run_script_with_input(
             reserve_call_slot(state)?;
             let (name, parsed) = parse_call_args(args);
             state.calls_made.set(state.calls_made.get() + 1);
-            let result = (state.call)(&name, parsed);
+            let index = state.executed.borrow().len();
+            let result = (state.call)(index, &name, parsed);
             // After the binding returns: the side effect has committed, so the
             // ledger reflects work actually done (#646).
             {
@@ -804,6 +837,11 @@ pub fn run_script_with_input(
                 .map(|s| s.to_std_string_escaped())
                 .unwrap_or_else(|| "null".to_string());
             store_checkpoint(&state.checkpoint, &raw, state.max_checkpoint_bytes)?;
+            if let Some(binding) = &state.checkpoint_binding {
+                if let Some(value) = state.checkpoint.borrow().as_ref() {
+                    binding(value).map_err(|error| JsNativeError::error().with_message(error))?;
+                }
+            }
             Ok(JsValue::undefined())
         },
         state.clone(),
@@ -1105,7 +1143,7 @@ fn flush_pending_host_calls(context: &mut Context, state: &HostState) -> Result<
             .iter()
             .map(|p| (p.name.clone(), p.args.clone()))
             .collect();
-        let results = run_calls_parallel(&state.call, names_args);
+        let results = run_calls_parallel(&state.call, state.executed.borrow().len(), names_args);
 
         // Record before resolving the promises: these calls have already run, and
         // a resolver that throws must not lose the fact that they did (#646).
@@ -1143,13 +1181,17 @@ fn flush_pending_host_calls(context: &mut Context, state: &HostState) -> Result<
 
 /// Run independent host tool calls, using a short-lived thread scope when more than one
 /// is ready so wall-clock tracks the slowest call in the batch rather than the sum.
-fn run_calls_parallel(call: &CallBinding, items: Vec<(String, Value)>) -> Vec<Value> {
+fn run_calls_parallel(
+    call: &IndexedCallBinding,
+    start_index: usize,
+    items: Vec<(String, Value)>,
+) -> Vec<Value> {
     if items.is_empty() {
         return Vec::new();
     }
     if items.len() == 1 {
         let (name, args) = &items[0];
-        return vec![call(name, args.clone())];
+        return vec![call(start_index, name, args.clone())];
     }
 
     let n = items.len();
@@ -1158,7 +1200,7 @@ fn run_calls_parallel(call: &CallBinding, items: Vec<(String, Value)>) -> Vec<Va
         let mut handles = Vec::with_capacity(n);
         for (i, (name, args)) in items.into_iter().enumerate() {
             let call = call;
-            handles.push(scope.spawn(move || (i, call(&name, args))));
+            handles.push(scope.spawn(move || (i, call(start_index + i, &name, args))));
         }
         for handle in handles {
             match handle.join() {
