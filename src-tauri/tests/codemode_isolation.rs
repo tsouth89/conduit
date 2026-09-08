@@ -39,13 +39,14 @@ impl Gateway {
         let mut reg = Registry::default();
         configure(&mut reg, &dir);
         registry::save_to(&dir.join("registry.json"), &reg).unwrap();
-        let executable = dir.join(format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX));
         // Allow a cross-compiled harness to run in a VM whose paths differ from
         // the build host. Native cargo test keeps using Cargo's exact binary.
         let gateway_binary = std::env::var_os("TOOLPORT_TEST_GATEWAY")
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_toolport-gateway").into());
-        std::fs::copy(gateway_binary, &executable).unwrap();
-        let mut command = Command::new(executable);
+        // Reuse the immutable build artifact. Copying executables while other
+        // tests spawn processes can leave inherited write handles (ETXTBSY).
+        // The registry and data directory still belong to this fixture alone.
+        let mut command = Command::new(gateway_binary);
         command
             .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
             .env("TOOLPORT_DATA_DIR", &dir)
@@ -344,10 +345,10 @@ fn stdio_rejects_oversized_source_data_input_and_schema() {
 }
 
 fn mock_registry(reg: &mut Registry, dir: &Path) {
-    let mock = dir.join(format!("mock-mcp-server{}", std::env::consts::EXE_SUFFIX));
-    let mock_binary = std::env::var_os("TOOLPORT_TEST_MOCK")
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_mock-mcp-server").into());
-    std::fs::copy(mock_binary, &mock).unwrap();
+    let mock = PathBuf::from(
+        std::env::var_os("TOOLPORT_TEST_MOCK")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_mock-mcp-server").into()),
+    );
     reg.servers.push(serde_json::from_value(json!({
         "id": "s", "name": "Fixture", "transport": "stdio", "command": mock,
         "env": [{ "key": "MOCK_MCP_TRANSCRIPT", "value": dir.join("downstream.jsonl"), "secret": false }]
